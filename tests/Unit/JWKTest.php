@@ -92,6 +92,20 @@ class JWKTest extends TestCase
         $this->assertTrue(\is_array($keys));
     }
 
+    public function testParseKeySetWithDuplicateKeyId()
+    {
+        $this->expectException(UnexpectedValueException::class);
+        $this->expectExceptionMessage('Duplicate key ID (kid) "jwk1" found in JWK Set');
+
+        $jwkSet = json_decode(
+            file_get_contents(__DIR__ . '/data/rsa-jwkset.json'),
+            true
+        );
+        $jwkSet['keys'][] = $jwkSet['keys'][0];
+
+        JWK::parseKeySet($jwkSet);
+    }
+
     /** @dataProvider provideParseJwkKeySet */
     public function testParseJwkKeySet($jwkFile, $keyId, $pubkeyFile)
     {

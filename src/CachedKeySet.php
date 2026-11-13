@@ -150,6 +150,11 @@ class CachedKeySet implements ArrayAccess
         $keys = [];
         foreach ($jwks['keys'] as $k => $v) {
             $kid = isset($v['kid']) ? $v['kid'] : $k;
+            if (isset($keys[(string) $kid])) {
+                throw new UnexpectedValueException(
+                    \sprintf('Duplicate key ID (kid) "%s" found in JWK Set', $kid)
+                );
+            }
             $keys[(string) $kid] = $v;
         }
 

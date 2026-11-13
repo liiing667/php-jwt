@@ -23,6 +23,8 @@ class CachedKeySetTest extends TestCase
     private $testCachedJwks1 = ['foo' => ['kid' => 'foo', 'kty' => 'RSA', 'alg' => 'foo', 'n' => '', 'e' => '']];
     private $testJwks2 = '{"keys": [{"kid":"bar","kty":"RSA","alg":"bar","n":"","e":""}]}';
     private $testJwks3 = '{"keys": [{"kid":"baz","kty":"RSA","n":"","e":""}]}';
+    private $testJwksDuplicateKid = '{"keys": [{"kid":"foo","kty":"RSA","alg":"foo","n":"","e":""},'
+        . '{"kid":"foo","kty":"RSA","alg":"bar","n":"","e":""}]}';
 
     private $googleRsaUri = 'https://www.googleapis.com/oauth2/v3/certs';
     private $googleEcUri = 'https://www.gstatic.com/iap/verify/public_key-jwk';
@@ -164,6 +166,74 @@ class CachedKeySetTest extends TestCase
             $this->prophesize(RequestFactoryInterface::class)->reveal(),
             $cache->reveal()
         );
+        $this->assertInstanceOf(Key::class, $cachedKeySet['foo']);
+        $this->assertSame('foo', $cachedKeySet['foo']->getAlgorithm());
+    }
+
+    public function testDuplicateKeyIdThrowsException()
+    {
+        $cacheItem = $this->prophesize(CacheItemInterface::class);
+        $cacheItem->isHit()
+            ->shouldBeCalledOnce()
+            ->willReturn(false);
+        $cacheItem->set(Argument::any())
+            ->shouldNotBeCalled();
+
+        $cache = $this->prophesize(CacheItemPoolInterface::class);
+        $cache->getItem($this->testJwksUriKey)
+            ->shouldBeCalledOnce()
+            ->willReturn($cacheItem->reveal());
+        $cache->save(Argument::any())
+            ->shouldNotBeCalled();
+
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $this->getMockHttpClient($this->testJwksDuplicateKid),
+            $this->getMockHttpFactory(),
+            $cache->reveal()
+        );
+
+        $this->expectException(\UnexpectedValueException::class);
+        $this->expectExceptionMessage('Duplicate key ID (kid) "foo" found in JWK Set');
+
+        isset($cachedKeySet['foo']);
+    }
+
+    public function testDuplicateKeyIdOnRefreshDoesNotPolluteCachedKeys()
+    {
+        $cacheItem = $this->prophesize(CacheItemInterface::class);
+        $cacheItem->isHit()
+            ->shouldBeCalledOnce()
+            ->willReturn(true);
+        $cacheItem->get()
+            ->shouldBeCalledOnce()
+            ->willReturn($this->testCachedJwks1);
+        $cacheItem->set(Argument::any())
+            ->shouldNotBeCalled();
+
+        $cache = $this->prophesize(CacheItemPoolInterface::class);
+        $cache->getItem($this->testJwksUriKey)
+            ->shouldBeCalledOnce()
+            ->willReturn($cacheItem->reveal());
+        $cache->save(Argument::any())
+            ->shouldNotBeCalled();
+
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $this->getMockHttpClient($this->testJwksDuplicateKid), // refreshed JWKS has duplicate kid
+            $this->getMockHttpFactory(),
+            $cache->reveal()
+        );
+
+        // The unknown key ID triggers a refresh which must be rejected as a whole
+        try {
+            isset($cachedKeySet['bar']);
+            $this->fail('Expected UnexpectedValueException was not thrown');
+        } catch (\UnexpectedValueException $e) {
+            $this->assertSame('Duplicate key ID (kid) "foo" found in JWK Set', $e->getMessage());
+        }
+
+        // The previously cached key set is still intact and readable
         $this->assertInstanceOf(Key::class, $cachedKeySet['foo']);
         $this->assertSame('foo', $cachedKeySet['foo']->getAlgorithm());
     }

@@ -3,7 +3,6 @@
 namespace Firebase\JWT;
 
 use ArrayAccess;
-use DateTime;
 use DomainException;
 use Exception;
 use InvalidArgumentException;
@@ -102,8 +101,9 @@ class JWT
         #[\SensitiveParameter] $keyOrKeyArray,
         ?stdClass &$headers = null
     ): stdClass {
-        // Validate JWT
-        $timestamp = \is_null(static::$timestamp) ? \time() : static::$timestamp;
+        // Capture the clock and leeway once so all time-claim checks and
+        // time-related exceptions share the same parse transaction.
+        $parseTransaction = JwtParseTransaction::capture(static::$timestamp, static::$leeway);
 
         if (empty($keyOrKeyArray)) {
             throw new InvalidArgumentException('Key may not be empty');
@@ -164,34 +164,8 @@ class JWT
             throw new SignatureInvalidException('Signature verification failed');
         }
 
-        // Check the nbf if it is defined. This is the time that the
-        // token can actually be used. If it's not yet that time, abort.
-        if (isset($payload->nbf) && floor($payload->nbf) > ($timestamp + static::$leeway)) {
-            $ex = new BeforeValidException(
-                'Cannot handle token with nbf prior to ' . \date(DateTime::ATOM, (int) floor($payload->nbf))
-            );
-            $ex->setPayload($payload);
-            throw $ex;
-        }
-
-        // Check that this token has been created before 'now'. This prevents
-        // using tokens that have been created for later use (and haven't
-        // correctly used the nbf claim).
-        if (!isset($payload->nbf) && isset($payload->iat) && floor($payload->iat) > ($timestamp + static::$leeway)) {
-            $ex = new BeforeValidException(
-                'Cannot handle token with iat prior to ' . \date(DateTime::ATOM, (int) floor($payload->iat))
-            );
-            $ex->setPayload($payload);
-            throw $ex;
-        }
-
-        // Check if this token has expired.
-        if (isset($payload->exp) && ($timestamp - static::$leeway) >= $payload->exp) {
-            $ex = new ExpiredException('Expired token');
-            $ex->setPayload($payload);
-            $ex->setTimestamp($timestamp);
-            throw $ex;
-        }
+        // Validate nbf, iat and exp using the transaction's clock and leeway.
+        $parseTransaction->validateTimeClaims($payload);
 
         return $payload;
     }

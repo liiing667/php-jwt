@@ -18,6 +18,12 @@ class JWTTest extends TestCase
         $this->hmacKey = $this->generateHmac256();
     }
 
+    public function tearDown(): void
+    {
+        JWT::$timestamp = null;
+        JWT::$leeway = 0;
+    }
+
     public function testUrlSafeCharacters()
     {
         $encoded = JWT::encode(['message' => 'f?'], $this->hmacKey->getKeyMaterial(), 'HS256');
@@ -158,6 +164,171 @@ class JWTTest extends TestCase
             $this->assertSame(98765, $exTimestamp);
             throw $e;
         }
+    }
+
+    /**
+     * @runInSeparateProcess
+     */
+    public function testExpirationBoundaryUsesOneTimeSnapshotOnRetry()
+    {
+        $exp = 100;
+        $encoded = JWT::encode([
+            'sub' => 'boundary-token',
+            'exp' => $exp,
+        ], $this->hmacKey->getKeyMaterial(), 'HS256');
+        $otherEncoded = JWT::encode([
+            'sub' => 'other-snapshot-token',
+            'exp' => $exp + 100,
+        ], $this->hmacKey->getKeyMaterial(), 'HS256');
+
+        JWT::$timestamp = $exp;
+
+        try {
+            JWT::decode($encoded, $this->hmacKey);
+            $this->fail('Expected token at the expiration boundary to be expired');
+        } catch (ExpiredException $firstException) {
+            $this->assertSame($exp, $firstException->getTimestamp());
+            $this->assertSame('boundary-token', $firstException->getPayload()->sub);
+            $this->assertSame($exp, $firstException->getPayload()->exp);
+        }
+
+        // A retry with a new clock must not mutate the exception created from
+        // the first decode's snapshot.
+        JWT::$timestamp = $exp + 100;
+
+        try {
+            JWT::decode($otherEncoded, $this->hmacKey);
+            $this->fail('Expected the second token to use its own expiration snapshot');
+        } catch (ExpiredException $otherException) {
+            $this->assertSame($exp + 100, $otherException->getTimestamp());
+            $this->assertSame('other-snapshot-token', $otherException->getPayload()->sub);
+            $this->assertSame($exp + 100, $otherException->getPayload()->exp);
+        }
+
+        try {
+            JWT::decode($encoded, $this->hmacKey);
+            $this->fail('Expected token at the expiration boundary to remain expired');
+        } catch (ExpiredException $retryException) {
+            $this->assertNotSame($firstException, $retryException);
+            $this->assertSame($exp + 100, $retryException->getTimestamp());
+            $this->assertSame($exp, $retryException->getPayload()->exp);
+        }
+
+        $this->assertSame($exp, $firstException->getTimestamp());
+        $this->assertSame('boundary-token', $firstException->getPayload()->sub);
+        $this->assertSame($exp, $firstException->getPayload()->exp);
+    }
+
+    /**
+     * @runInSeparateProcess
+     */
+    public function testTimeClaimsUseLeewayCapturedForTheParseTransaction()
+    {
+        $encoded = JWT::encode([
+            'sub' => 'snapshot-token',
+            'exp' => 100,
+        ], $this->hmacKey->getKeyMaterial(), 'HS256');
+
+        JWT::$timestamp = 99;
+        JWT::$leeway = 1;
+
+        $this->assertSame('snapshot-token', JWT::decode($encoded, $this->hmacKey)->sub);
+
+        JWT::$timestamp = 100;
+
+        try {
+            LeewayChangingJWT::decode($encoded, $this->hmacKey);
+            $this->fail('Expected the token to use the leeway captured for this decode');
+        } catch (ExpiredException $exception) {
+            $this->assertSame(100, $exception->getTimestamp());
+            $this->assertSame(100, $exception->getPayload()->exp);
+            $this->assertSame('snapshot-token', $exception->getPayload()->sub);
+        }
+    }
+
+    /**
+     * @runInSeparateProcess
+     */
+    public function testTimeClaimsUseTimestampCapturedForTheParseTransaction()
+    {
+        $encoded = JWT::encode([
+            'sub' => 'clock-snapshot-token',
+            'exp' => 100,
+        ], $this->hmacKey->getKeyMaterial(), 'HS256');
+
+        JWT::$timestamp = 100;
+
+        try {
+            ClockChangingJWT::decode($encoded, $this->hmacKey);
+            $this->fail('Expected the token to use the timestamp captured for this decode');
+        } catch (ExpiredException $exception) {
+            $this->assertSame(100, $exception->getTimestamp());
+            $this->assertSame(100, $exception->getPayload()->exp);
+            $this->assertSame('clock-snapshot-token', $exception->getPayload()->sub);
+        }
+    }
+
+    /**
+     * @dataProvider provideTimeClaimBoundaries
+     * @runInSeparateProcess
+     * @param array<string, int|float> $validPayload
+     * @param array<string, int|float> $invalidPayload
+     * @param string $expectedException
+     */
+    public function testTimeClaimBoundariesRemainCompatible(
+        array $validPayload,
+        array $invalidPayload,
+        string $expectedException
+    )
+    {
+        JWT::$timestamp = 100;
+        JWT::$leeway = 1;
+
+        $validToken = JWT::encode($validPayload, $this->hmacKey->getKeyMaterial(), 'HS256');
+        $this->assertEquals((object) $validPayload, JWT::decode($validToken, $this->hmacKey));
+
+        $invalidToken = JWT::encode($invalidPayload, $this->hmacKey->getKeyMaterial(), 'HS256');
+        $this->expectException($expectedException);
+        JWT::decode($invalidToken, $this->hmacKey);
+    }
+
+    /**
+     * @return array<string, array{0: array<string, int|float>, 1: array<string, int|float>, 2: string}>
+     */
+    public function provideTimeClaimBoundaries(): array
+    {
+        return [
+            'exp' => [
+                ['exp' => 101],
+                ['exp' => 99],
+                ExpiredException::class,
+            ],
+            'exp with fractional second' => [
+                ['exp' => 100.5],
+                ['exp' => 99.5],
+                ExpiredException::class,
+            ],
+            'nbf' => [
+                ['nbf' => 100],
+                ['nbf' => 102],
+                BeforeValidException::class,
+            ],
+            'nbf with fractional second' => [
+                ['nbf' => 101.5],
+                ['nbf' => 102.5],
+                BeforeValidException::class,
+            ],
+            'iat without nbf' => [
+                ['iat' => 100],
+                ['iat' => 102],
+                BeforeValidException::class,
+            ],
+            'iat with fractional second' => [
+                ['iat' => 101.5],
+                ['iat' => 102.5],
+                BeforeValidException::class,
+            ],
+        ];
     }
 
     public function testBeforeValidExceptionPayload()
@@ -894,5 +1065,25 @@ class JWTTest extends TestCase
     private function generateHmac256(): Key
     {
         return new Key(random_bytes(32), 'HS256');
+    }
+}
+
+class LeewayChangingJWT extends JWT
+{
+    public static function urlsafeB64Decode(string $input): string
+    {
+        JWT::$leeway = 0;
+
+        return parent::urlsafeB64Decode($input);
+    }
+}
+
+class ClockChangingJWT extends JWT
+{
+    public static function urlsafeB64Decode(string $input): string
+    {
+        JWT::$timestamp = 101;
+
+        return parent::urlsafeB64Decode($input);
     }
 }

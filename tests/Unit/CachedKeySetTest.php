@@ -406,6 +406,241 @@ class CachedKeySetTest extends TestCase
         }
     }
 
+    public function testDuplicateKidIsRejectedAndNeverResolvesToAnotherKey()
+    {
+        // Two distinct keys claim the same "kid". The second one must not
+        // silently shadow the first, otherwise a token for "jwk1" could be
+        // verified against the attacker's key material.
+        $jwks1 = file_get_contents(__DIR__ . '/data/rsa-jwkset.json');
+        $jwks = json_decode($jwks1, true);
+        $jwks['keys'][1]['kid'] = 'jwk1'; // force a "kid" collision
+        $conflictingJwks = json_encode($jwks);
+
+        $cache = $this->getTestMemoryCacheItemPool();
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $this->getMockHttpClient($conflictingJwks),
+            $this->getMockHttpFactory(),
+            $cache
+        );
+
+        try {
+            isset($cachedKeySet['jwk1']);
+            $this->fail('Expected UnexpectedValueException for the conflicting kid');
+        } catch (\UnexpectedValueException $e) {
+            $this->assertStringContainsString('Conflicting key ID "jwk1"', $e->getMessage());
+        }
+
+        // The conflicting response must never have been committed to the cache.
+        $this->assertFalse($cache->getItem($this->testJwksUriKey)->isHit());
+        // And the conflicting material must never be resolvable for the token.
+        $this->assertArrayNotHasKey('jwk1', $cachedKeySet);
+    }
+
+    public function testPositionalKeyDoesNotSilentlyCollideWithExplicitKid()
+    {
+        // A key without "kid" is addressable by its position. Here the first
+        // key (position "0") and an explicit "kid": "0" entry resolve to the
+        // same identifier, which must be rejected instead of one shadowing the
+        // other.
+        $jwks = json_encode([
+            'keys' => [
+                ['kty' => 'RSA', 'alg' => 'RS256', 'n' => 'positional', 'e' => 'AQAB'],
+                ['kid' => '0', 'kty' => 'RSA', 'alg' => 'RS256', 'n' => 'explicit', 'e' => 'AQAB'],
+            ],
+        ]);
+
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $this->getMockHttpClient($jwks),
+            $this->getMockHttpFactory(),
+            $this->getTestMemoryCacheItemPool()
+        );
+
+        $this->expectException(\UnexpectedValueException::class);
+        $this->expectExceptionMessage('Conflicting key ID "0"');
+
+        isset($cachedKeySet['0']);
+    }
+
+    public function testRefreshTransactionIsAtomicOnMalformedRetry()
+    {
+        // First call installs a valid JWKS into the cache and memory.
+        $validJwks = file_get_contents(__DIR__ . '/data/rsa-jwkset.json');
+        // The refresh for a missing kid returns a malformed set.
+        $malformedJwks = '{"keys": []}';
+
+        $http = $this->getMockSequentialHttpClient([$validJwks, $malformedJwks]);
+        $factory = $this->getMockSequentialHttpFactory(2);
+        $cache = $this->getTestMemoryCacheItemPool();
+
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $http,
+            $factory,
+            $cache
+        );
+
+        $this->assertArrayHasKey('jwk1', $cachedKeySet);
+
+        try {
+            isset($cachedKeySet['unknown-kid']);
+            $this->fail('Expected InvalidArgumentException from the empty JWK Set');
+        } catch (\InvalidArgumentException $e) {
+            $this->assertSame('JWK Set did not contain any keys', $e->getMessage());
+        }
+
+        // The failed refresh must not have wiped or partially replaced the
+        // previously installed, consistent key set: the original kid still
+        // resolves to the original key material without another HTTP round trip.
+        $key = $cachedKeySet['jwk1'];
+        $this->assertInstanceOf(Key::class, $key);
+        $cached = $cache->getItem($this->testJwksUriKey);
+        $this->assertTrue($cached->isHit());
+        $this->assertArrayHasKey('jwk1', $cached->get());
+        $this->assertArrayHasKey('jwk2', $cached->get());
+    }
+
+    public function testRefreshTransactionIsAtomicWhenCacheWriteFails()
+    {
+        $cacheItem = $this->prophesize(CacheItemInterface::class);
+        $cacheItem->isHit()->willReturn(false);
+        $cacheItem->set(Argument::any())->will(function () {
+            return $this;
+        });
+
+        $cache = $this->prophesize(CacheItemPoolInterface::class);
+        $cache->getItem($this->testJwksUriKey)->willReturn($cacheItem->reveal());
+        $cache->save(Argument::any())->willThrow(new RuntimeException('cache unavailable'));
+
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $this->getMockHttpClient($this->testJwks1),
+            $this->getMockHttpFactory(),
+            $cache->reveal()
+        );
+
+        try {
+            isset($cachedKeySet['foo']);
+            $this->fail('Expected RuntimeException from the cache pool');
+        } catch (RuntimeException $e) {
+            $this->assertSame('cache unavailable', $e->getMessage());
+        }
+
+        // The in-memory key set must not diverge from the cache: nothing is
+        // resolvable because nothing was committed.
+        $this->assertArrayNotHasKey('foo', $cachedKeySet);
+    }
+
+    public function testKidConflictAfterRotationCannotAttributeAnotherKeyToToken()
+    {
+        // A token signed by key 1 ("jwk1") must never be accepted from a rotated
+        // set where a *different* key also claims "jwk1". With a shared cache,
+        // each request/process builds a fresh CachedKeySet over the same pool,
+        // which is exactly where a partial/non-atomic refresh used to mix old
+        // and new kid->material mappings.
+        $privKey1 = file_get_contents(__DIR__ . '/data/rsa1-private.pem');
+        $payload = ['sub' => 'foo', 'exp' => strtotime('+10 seconds')];
+        $msg = JWT::encode($payload, $privKey1, 'RS256', 'jwk1');
+
+        $validJwks = file_get_contents(__DIR__ . '/data/rsa-jwkset.json');
+        $jwks = json_decode($validJwks, true);
+        // Rotation response: key 2's material is published under "jwk1" as well,
+        // producing an ambiguous, conflicting JWK Set.
+        $jwks['keys'][1]['kid'] = 'jwk1';
+        $rotatedJwks = json_encode($jwks);
+
+        $cache = $this->getTestMemoryCacheItemPool();
+
+        // Request 1: a fresh key set installs the legitimate JWKS into the pool.
+        $firstKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $this->getMockHttpClient($validJwks),
+            $this->getMockHttpFactory(),
+            $cache
+        );
+        $this->assertSame('foo', JWT::decode($msg, $firstKeySet)->sub);
+
+        // Rotation: drop the cached version so the next request must refresh.
+        $cache->deleteItem($this->testJwksUriKey);
+
+        // Request 2: a brand new CachedKeySet (same pool) fetches the conflicting set.
+        $secondKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $this->getMockHttpClient($rotatedJwks),
+            $this->getMockHttpFactory(),
+            $cache
+        );
+
+        try {
+            JWT::decode($msg, $secondKeySet);
+            $this->fail('Expected UnexpectedValueException for the conflicting kid');
+        } catch (\UnexpectedValueException $e) {
+            $this->assertStringContainsString('Conflicting key ID "jwk1"', $e->getMessage());
+        }
+
+        // The conflicting set must never have been committed, so neither the
+        // pool nor a subsequently built key set can attribute key 2 to the token.
+        $this->assertFalse($cache->getItem($this->testJwksUriKey)->isHit());
+        $this->assertArrayNotHasKey('jwk1', $secondKeySet);
+    }
+
+    public function testRotationServesNewMaterialForNewTokenAndOldMaterialForCachedToken()
+    {
+        // End-to-end refresh transaction across requests sharing one cache pool:
+        // after rotation each committed snapshot is internally consistent, and a
+        // token only verifies against the material bound to its kid.
+        $privKey1 = file_get_contents(__DIR__ . '/data/rsa1-private.pem');
+        $privKey2 = file_get_contents(__DIR__ . '/data/rsa2-private.pem');
+        $jwks1 = file_get_contents(__DIR__ . '/data/rsa-jwkset.json');
+        $jwks2 = file_get_contents(__DIR__ . '/data/rsa-jwkset-2.json');
+
+        $cache = $this->getTestMemoryCacheItemPool();
+
+        // Request 1: token signed by key 1 verifies against the first snapshot.
+        $firstKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $this->getMockHttpClient($jwks1),
+            $this->getMockHttpFactory(),
+            $cache
+        );
+        $token1 = JWT::encode(
+            ['sub' => 'one', 'exp' => strtotime('+10 seconds')],
+            $privKey1,
+            'RS256',
+            'jwk1'
+        );
+        $this->assertSame('one', JWT::decode($token1, $firstKeySet)->sub);
+
+        // Rotate: jwk1 disappears; jwk2 now points at brand new material.
+        $cache->deleteItem($this->testJwksUriKey);
+        $token2 = JWT::encode(
+            ['sub' => 'two', 'exp' => strtotime('+10 seconds')],
+            $privKey2,
+            'RS256',
+            'jwk2'
+        );
+
+        // Request 2: a fresh key set over the same pool loads the new snapshot.
+        $secondKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $this->getMockHttpClient($jwks2),
+            $this->getMockHttpFactory(),
+            $cache
+        );
+        $this->assertSame('two', JWT::decode($token2, $secondKeySet)->sub);
+
+        // The old kid is gone from the committed snapshot and the old token
+        // cannot borrow another key's material.
+        $this->assertArrayNotHasKey('jwk1', $secondKeySet);
+        try {
+            JWT::decode($token1, $secondKeySet);
+            $this->fail('Expected OutOfBoundsException for the retired kid');
+        } catch (OutOfBoundsException $e) {
+            $this->assertSame('Key ID not found', $e->getMessage());
+        }
+    }
+
     /**
      * @dataProvider provideFullIntegration
      */
@@ -478,6 +713,40 @@ class CachedKeySetTest extends TestCase
         $factory->createRequest('GET', $this->testJwksUri)
             ->shouldBeCalledTimes($timesCalled)
             ->willReturn($request->reveal());
+
+        return $factory->reveal();
+    }
+
+    private function getMockSequentialHttpClient(array $bodies)
+    {
+        $responses = [];
+        foreach ($bodies as $body) {
+            $stream = $this->prophesize('Psr\Http\Message\StreamInterface');
+            $stream->__toString()->willReturn($body);
+
+            $response = $this->prophesize('Psr\Http\Message\ResponseInterface');
+            $response->getBody()->willReturn($stream->reveal());
+            $response->getStatusCode()->willReturn(200);
+
+            $responses[] = $response->reveal();
+        }
+
+        $http = $this->prophesize(ClientInterface::class);
+        $http->sendRequest(Argument::any())
+            ->will(function () use (&$responses) {
+                return array_shift($responses);
+            });
+
+        return $http->reveal();
+    }
+
+    private function getMockSequentialHttpFactory(int $timesCalled = 1)
+    {
+        $request = $this->prophesize('Psr\Http\Message\RequestInterface')->reveal();
+        $factory = $this->prophesize(RequestFactoryInterface::class);
+        $factory->createRequest('GET', $this->testJwksUri)
+            ->shouldBeCalledTimes($timesCalled)
+            ->willReturn($request);
 
         return $factory->reveal();
     }

@@ -103,6 +103,10 @@ class CachedKeySet implements ArrayAccess
         if (!$this->keyIdExists($keyId)) {
             throw new OutOfBoundsException('Key ID not found');
         }
+        // Re-resolve the key material from the same, consistent key set snapshot
+        // that accepted the key id. Never cache a parsed Key across a refresh
+        // transaction, otherwise rotation could pair a new "kid" with stale
+        // key material.
         return JWK::parseKey($this->keySet[$keyId], $this->defaultAlg);
     }
 
@@ -149,8 +153,25 @@ class CachedKeySet implements ArrayAccess
 
         $keys = [];
         foreach ($jwks['keys'] as $k => $v) {
-            $kid = isset($v['kid']) ? $v['kid'] : $k;
-            $keys[(string) $kid] = $v;
+            // Keys without a "kid" remain addressable by their positional index
+            // in the set (previous behavior); keys with a "kid" are addressed
+            // by that identifier.
+            $kid = (string) (isset($v['kid']) ? $v['kid'] : $k);
+
+            if (isset($keys[$kid])) {
+                // Resolving a token must never be ambiguous. Refuse to build a
+                // key set in which one "kid" maps to more than one key, because
+                // the last entry would otherwise silently shadow the first and
+                // could attribute another key's material to the current token.
+                throw new UnexpectedValueException(
+                    \sprintf(
+                        'Conflicting key ID "%s" found in JWK Set; a "kid" must map to exactly one key',
+                        $kid
+                    )
+                );
+            }
+
+            $keys[$kid] = $v;
         }
 
         return $keys;
@@ -172,38 +193,65 @@ class CachedKeySet implements ArrayAccess
             }
         }
 
-        if (!isset($this->keySet[$keyId])) {
+        if (!\is_array($this->keySet) || !isset($this->keySet[$keyId])) {
             if ($this->rateLimitExceeded()) {
                 return false;
             }
-            $request = $this->httpFactory->createRequest('GET', $this->jwksUri);
-            $jwksResponse = $this->httpClient->sendRequest($request);
-            if ($jwksResponse->getStatusCode() !== 200) {
-                throw new UnexpectedValueException(
-                    \sprintf(
-                        'HTTP Error: %d %s for URI "%s"',
-                        $jwksResponse->getStatusCode(),
-                        $jwksResponse->getReasonPhrase(),
-                        $this->jwksUri,
-                    ),
-                    $jwksResponse->getStatusCode()
-                );
-            }
-            $this->keySet = $this->formatJwksForCache((string) $jwksResponse->getBody());
+            $this->refreshKeySet();
 
             if (!isset($this->keySet[$keyId])) {
                 return false;
             }
-
-            $item = $this->getCacheItem();
-            $item->set($this->keySet);
-            if ($this->expiresAfter) {
-                $item->expiresAfter($this->expiresAfter);
-            }
-            $this->cache->save($item);
         }
 
         return true;
+    }
+
+    /**
+     * Fetches and installs a fresh JWK Set as a single refresh transaction.
+     *
+     * The JWKS version, every "kid", its key material and the cached copy are
+     * all derived from the same HTTP response: the response is fully fetched and
+     * validated into a local, staged key set first, and only then are the
+     * in-memory key set and the cache updated atomically. If anything fails
+     * (HTTP error, malformed payload, a conflicting "kid", or a cache write
+     * failure) neither the in-memory key set nor the cache is modified, so a
+     * retry or a "kid" conflict can never attribute another key's material to
+     * the current token.
+     */
+    private function refreshKeySet(): void
+    {
+        $request = $this->httpFactory->createRequest('GET', $this->jwksUri);
+        $jwksResponse = $this->httpClient->sendRequest($request);
+        if ($jwksResponse->getStatusCode() !== 200) {
+            throw new UnexpectedValueException(
+                \sprintf(
+                    'HTTP Error: %d %s for URI "%s"',
+                    $jwksResponse->getStatusCode(),
+                    $jwksResponse->getReasonPhrase(),
+                    $this->jwksUri,
+                ),
+                $jwksResponse->getStatusCode()
+            );
+        }
+
+        // Stage the complete, validated key set before touching any shared state.
+        // A malformed set or a "kid" collision throws here and leaves the
+        // previously installed version (and its cache entry) untouched.
+        $stagedKeySet = $this->formatJwksForCache((string) $jwksResponse->getBody());
+
+        $item = $this->getCacheItem();
+        $item->set($stagedKeySet);
+        if ($this->expiresAfter) {
+            $item->expiresAfter($this->expiresAfter);
+        }
+
+        // Commit the cache first; if this fails, keep serving the previous
+        // version instead of diverging the in-memory set from the cache.
+        $this->cache->save($item);
+
+        // Commit the in-memory key set last so it always matches the cache.
+        $this->keySet = $stagedKeySet;
     }
 
     private function rateLimitExceeded(): bool

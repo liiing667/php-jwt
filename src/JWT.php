@@ -3,7 +3,6 @@
 namespace Firebase\JWT;
 
 use ArrayAccess;
-use DateTime;
 use DomainException;
 use Exception;
 use InvalidArgumentException;
@@ -102,98 +101,84 @@ class JWT
         #[\SensitiveParameter] $keyOrKeyArray,
         ?stdClass &$headers = null
     ): stdClass {
-        // Validate JWT
         $timestamp = \is_null(static::$timestamp) ? \time() : static::$timestamp;
+        $leeway = static::$leeway;
+
+        // Freeze the algorithm registry at the start of this decode. A retry or
+        // a hook invoked while parsing must not remap an algorithm family.
+        $supportedAlgorithms = static::$supported_algs;
+        $directKeySnapshot = $keyOrKeyArray instanceof Key
+            ? [$keyOrKeyArray->getAlgorithm(), $keyOrKeyArray->getKeyMaterial()]
+            : null;
+        $keyArraySnapshots = [];
+        if (\is_array($keyOrKeyArray)) {
+            foreach ($keyOrKeyArray as $keyId => $candidate) {
+                if ($candidate instanceof Key) {
+                    $keyArraySnapshots[(string) $keyId] = [
+                        $candidate->getAlgorithm(),
+                        $candidate->getKeyMaterial(),
+                    ];
+                }
+            }
+        }
 
         if (empty($keyOrKeyArray)) {
             throw new InvalidArgumentException('Key may not be empty');
         }
-        $tks = \explode('.', $jwt, 4);
-        if (\count($tks) !== 3) {
-            throw new UnexpectedValueException('Wrong number of segments');
-        }
-        list($headb64, $bodyb64, $cryptob64) = $tks;
-        $headerRaw = static::urlsafeB64Decode($headb64);
-        if (null === ($header = static::jsonDecode($headerRaw))) {
-            throw new UnexpectedValueException('Invalid header encoding');
-        }
-        if ($headers !== null) {
-            $headers = $header;
-        }
-        $payloadRaw = static::urlsafeB64Decode($bodyb64);
-        if (null === ($payload = static::jsonDecode($payloadRaw))) {
-            throw new UnexpectedValueException('Invalid claims encoding');
-        }
-        if (\is_array($payload)) {
-            // prevent PHP Fatal Error in edge-cases when payload is empty array
-            $payload = (object) $payload;
-        }
-        if (!$payload instanceof stdClass) {
-            throw new UnexpectedValueException('Payload must be a JSON object');
-        }
-        if (isset($payload->iat) && !\is_numeric($payload->iat)) {
-            throw new UnexpectedValueException('Payload iat must be a number');
-        }
-        if (isset($payload->nbf) && !\is_numeric($payload->nbf)) {
-            throw new UnexpectedValueException('Payload nbf must be a number');
-        }
-        if (isset($payload->exp) && !\is_numeric($payload->exp)) {
-            throw new UnexpectedValueException('Payload exp must be a number');
-        }
 
-        $sig = static::urlsafeB64Decode($cryptob64);
-        if (empty($header->alg)) {
+        // Parse header/payload/signature once. The same transaction supplies
+        // the claims returned to the caller and the payload attached to errors.
+        $parseTransaction = JwtParseTransaction::capture(
+            $jwt,
+            static::class,
+            static function ($header) use (&$headers): void {
+                if (null !== $headers) {
+                    $headers = $header;
+                }
+            }
+        );
+        $header = $parseTransaction->header();
+        $parseTransaction->validateClaimTypes();
+
+        $headerIsObject = \is_object($header);
+        $alg = $headerIsObject && property_exists($header, 'alg') ? $header->alg : null;
+        if (empty($alg)) {
             throw new UnexpectedValueException('Empty algorithm');
         }
-        if (empty(static::$supported_algs[$header->alg])) {
+        if (!\is_string($alg) || empty($supportedAlgorithms[$alg])) {
             throw new UnexpectedValueException('Algorithm not supported');
         }
 
-        $key = self::getKey($keyOrKeyArray, property_exists($header, 'kid') ? $header->kid : null);
+        $kid = $headerIsObject && property_exists($header, 'kid') ? $header->kid : null;
+        $key = self::getKey($keyOrKeyArray, $kid);
 
-        // Check the algorithm
-        if (!self::constantTimeEquals($key->getAlgorithm(), $header->alg)) {
-            // See issue #351
-            throw new UnexpectedValueException('Incorrect key for this algorithm');
+        // Bind header alg, Key alg, key material and key length to one policy
+        // snapshot. No later step re-reads the mutable globals or the Key.
+        if (null === $directKeySnapshot && \is_scalar($kid) && isset($keyArraySnapshots[(string) $kid])) {
+            $directKeySnapshot = $keyArraySnapshots[(string) $kid];
         }
-        if (\in_array($header->alg, ['ES256', 'ES256K', 'ES384'], true)) {
+        $policy = null === $directKeySnapshot
+            ? JwtAlgorithmPolicy::capture($alg, $key, $supportedAlgorithms)
+            : JwtAlgorithmPolicy::captureSnapshot(
+                $alg,
+                $directKeySnapshot[0],
+                $directKeySnapshot[1],
+                $supportedAlgorithms
+            );
+
+        $sig = $parseTransaction->signature();
+        if ($policy->usesDerSignature()) {
             // OpenSSL expects an ASN.1 DER sequence for ES256/ES256K/ES384 signatures
             $sig = self::signatureToDER($sig);
         }
-        if (!self::verify("{$headb64}.{$bodyb64}", $sig, $key->getKeyMaterial(), $header->alg)) {
-            throw new SignatureInvalidException('Signature verification failed');
+        if (!self::verify($parseTransaction->signingInput(), $sig, $policy)) {
+            throw $parseTransaction->createSignatureInvalidException();
         }
 
-        // Check the nbf if it is defined. This is the time that the
-        // token can actually be used. If it's not yet that time, abort.
-        if (isset($payload->nbf) && floor($payload->nbf) > ($timestamp + static::$leeway)) {
-            $ex = new BeforeValidException(
-                'Cannot handle token with nbf prior to ' . \date(DateTime::ATOM, (int) floor($payload->nbf))
-            );
-            $ex->setPayload($payload);
-            throw $ex;
-        }
+        // Validate nbf, iat and exp on the same parsed claims snapshot.
+        $parseTransaction->validateTimeClaims($timestamp, $leeway);
 
-        // Check that this token has been created before 'now'. This prevents
-        // using tokens that have been created for later use (and haven't
-        // correctly used the nbf claim).
-        if (!isset($payload->nbf) && isset($payload->iat) && floor($payload->iat) > ($timestamp + static::$leeway)) {
-            $ex = new BeforeValidException(
-                'Cannot handle token with iat prior to ' . \date(DateTime::ATOM, (int) floor($payload->iat))
-            );
-            $ex->setPayload($payload);
-            throw $ex;
-        }
-
-        // Check if this token has expired.
-        if (isset($payload->exp) && ($timestamp - static::$leeway) >= $payload->exp) {
-            $ex = new ExpiredException('Expired token');
-            $ex->setPayload($payload);
-            $ex->setTimestamp($timestamp);
-            throw $ex;
-        }
-
-        return $payload;
+        return $parseTransaction->payload();
     }
 
     /**
@@ -314,9 +299,7 @@ class JWT
      *
      * @param string $msg         The original message (header and body)
      * @param string $signature   The original signature
-     * @param string|OpenSSLAsymmetricKey|OpenSSLCertificate  $keyMaterial For Ed*, ES*, HS*, a string key works.
-     *                                                        for RS*, must be an instance of OpenSSLAsymmetricKey
-     * @param string $alg         The algorithm
+     * @param JwtAlgorithmPolicy $policy Algorithm/key snapshot for this decode
      *
      * @return bool
      *
@@ -325,26 +308,16 @@ class JWT
     private static function verify(
         string $msg,
         string $signature,
-        #[\SensitiveParameter] $keyMaterial,
-        string $alg
+        JwtAlgorithmPolicy $policy
     ): bool {
-        if (empty(static::$supported_algs[$alg])) {
-            throw new DomainException('Algorithm not supported');
-        }
+        $alg = $policy->algorithm();
+        $algorithm = $policy->hashAlgorithm();
+        $keyMaterial = $policy->keyMaterial();
 
-        list($function, $algorithm) = static::$supported_algs[$alg];
-        switch ($function) {
+        switch ($policy->function()) {
             case 'openssl':
                 if ($alg === 'PS256') {
                     return self::verifyPS256($keyMaterial, $msg, $signature);
-                }
-                if (!$key = openssl_pkey_get_public($keyMaterial)) {
-                    throw new DomainException('OpenSSL unable to validate key');
-                }
-                if (str_starts_with($alg, 'RS')) {
-                    self::validateRsaKeyLength($key);
-                } elseif (str_starts_with($alg, 'ES')) {
-                    self::validateEcKeyLength($key, $alg);
                 }
                 $success = \openssl_verify($msg, $signature, $keyMaterial, $algorithm);
                 if ($success === 1) {
@@ -372,7 +345,6 @@ class JWT
                 if (!\is_string($keyMaterial)) {
                     throw new InvalidArgumentException('key must be a string when using hmac');
                 }
-                self::validateHmacKeyLength($keyMaterial, $algorithm);
                 $hash = \hash_hmac($algorithm, $msg, $keyMaterial, true);
                 return self::constantTimeEquals($hash, $signature);
         }

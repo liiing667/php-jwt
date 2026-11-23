@@ -3,7 +3,6 @@
 namespace Firebase\JWT;
 
 use ArrayAccess;
-use DateTime;
 use DomainException;
 use Exception;
 use InvalidArgumentException;
@@ -102,46 +101,28 @@ class JWT
         #[\SensitiveParameter] $keyOrKeyArray,
         ?stdClass &$headers = null
     ): stdClass {
-        // Validate JWT
         $timestamp = \is_null(static::$timestamp) ? \time() : static::$timestamp;
+        $leeway = static::$leeway;
 
         if (empty($keyOrKeyArray)) {
             throw new InvalidArgumentException('Key may not be empty');
         }
-        $tks = \explode('.', $jwt, 4);
-        if (\count($tks) !== 3) {
-            throw new UnexpectedValueException('Wrong number of segments');
-        }
-        list($headb64, $bodyb64, $cryptob64) = $tks;
-        $headerRaw = static::urlsafeB64Decode($headb64);
-        if (null === ($header = static::jsonDecode($headerRaw))) {
-            throw new UnexpectedValueException('Invalid header encoding');
-        }
-        if ($headers !== null) {
-            $headers = $header;
-        }
-        $payloadRaw = static::urlsafeB64Decode($bodyb64);
-        if (null === ($payload = static::jsonDecode($payloadRaw))) {
-            throw new UnexpectedValueException('Invalid claims encoding');
-        }
-        if (\is_array($payload)) {
-            // prevent PHP Fatal Error in edge-cases when payload is empty array
-            $payload = (object) $payload;
-        }
-        if (!$payload instanceof stdClass) {
-            throw new UnexpectedValueException('Payload must be a JSON object');
-        }
-        if (isset($payload->iat) && !\is_numeric($payload->iat)) {
-            throw new UnexpectedValueException('Payload iat must be a number');
-        }
-        if (isset($payload->nbf) && !\is_numeric($payload->nbf)) {
-            throw new UnexpectedValueException('Payload nbf must be a number');
-        }
-        if (isset($payload->exp) && !\is_numeric($payload->exp)) {
-            throw new UnexpectedValueException('Payload exp must be a number');
-        }
 
-        $sig = static::urlsafeB64Decode($cryptob64);
+        // Parse the compact token once. The same transaction is used for the
+        // header/payload, claim checks, signature input and exception payloads.
+        $parseTransaction = JwtParseTransaction::capture(
+            $jwt,
+            static::class,
+            static function ($header) use (&$headers): void {
+                if (null !== $headers) {
+                    $headers = $header;
+                }
+            }
+        );
+        $header = $parseTransaction->header();
+        $parseTransaction->validateClaimTypes();
+
+        $sig = $parseTransaction->signature();
         if (empty($header->alg)) {
             throw new UnexpectedValueException('Empty algorithm');
         }
@@ -160,40 +141,14 @@ class JWT
             // OpenSSL expects an ASN.1 DER sequence for ES256/ES256K/ES384 signatures
             $sig = self::signatureToDER($sig);
         }
-        if (!self::verify("{$headb64}.{$bodyb64}", $sig, $key->getKeyMaterial(), $header->alg)) {
-            throw new SignatureInvalidException('Signature verification failed');
+        if (!self::verify($parseTransaction->signingInput(), $sig, $key->getKeyMaterial(), $header->alg)) {
+            throw $parseTransaction->createSignatureInvalidException();
         }
 
-        // Check the nbf if it is defined. This is the time that the
-        // token can actually be used. If it's not yet that time, abort.
-        if (isset($payload->nbf) && floor($payload->nbf) > ($timestamp + static::$leeway)) {
-            $ex = new BeforeValidException(
-                'Cannot handle token with nbf prior to ' . \date(DateTime::ATOM, (int) floor($payload->nbf))
-            );
-            $ex->setPayload($payload);
-            throw $ex;
-        }
+        // Validate nbf, iat and exp on the same parsed claims snapshot.
+        $parseTransaction->validateTimeClaims($timestamp, $leeway);
 
-        // Check that this token has been created before 'now'. This prevents
-        // using tokens that have been created for later use (and haven't
-        // correctly used the nbf claim).
-        if (!isset($payload->nbf) && isset($payload->iat) && floor($payload->iat) > ($timestamp + static::$leeway)) {
-            $ex = new BeforeValidException(
-                'Cannot handle token with iat prior to ' . \date(DateTime::ATOM, (int) floor($payload->iat))
-            );
-            $ex->setPayload($payload);
-            throw $ex;
-        }
-
-        // Check if this token has expired.
-        if (isset($payload->exp) && ($timestamp - static::$leeway) >= $payload->exp) {
-            $ex = new ExpiredException('Expired token');
-            $ex->setPayload($payload);
-            $ex->setTimestamp($timestamp);
-            throw $ex;
-        }
-
-        return $payload;
+        return $parseTransaction->payload();
     }
 
     /**
@@ -389,13 +344,21 @@ class JWT
      */
     public static function jsonDecode(string $input)
     {
-        $obj = \json_decode($input, false, 512, JSON_BIGINT_AS_STRING);
+        try {
+            $obj = \json_decode(
+                $input,
+                false,
+                512,
+                JSON_BIGINT_AS_STRING | JSON_THROW_ON_ERROR
+            );
+        } catch (\JsonException $e) {
+            throw self::handleJsonError($e->getCode());
+        }
 
-        if ($errno = \json_last_error()) {
-            self::handleJsonError($errno);
-        } elseif ($obj === null && $input !== 'null') {
+        if ($obj === null && $input !== 'null') {
             throw new DomainException('Null result with non-null input');
         }
+
         return $obj;
     }
 
@@ -410,15 +373,19 @@ class JWT
      */
     public static function jsonEncode(array $input): string
     {
-        $json = \json_encode($input, \JSON_UNESCAPED_SLASHES);
-        if ($errno = \json_last_error()) {
-            self::handleJsonError($errno);
-        } elseif ($json === 'null') {
+        try {
+            $json = \json_encode($input, \JSON_UNESCAPED_SLASHES | \JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            throw self::handleJsonError($e->getCode());
+        }
+
+        if ($json === 'null') {
             throw new DomainException('Null result with non-null input');
         }
         if ($json === false) {
             throw new DomainException('Provided object could not be encoded to valid JSON');
         }
+
         return $json;
     }
 
@@ -528,11 +495,9 @@ class JWT
      *
      * @param int $errno An error number from json_last_error()
      *
-     * @throws DomainException
-     *
-     * @return void
+     * @return DomainException
      */
-    private static function handleJsonError(int $errno): void
+    private static function handleJsonError(int $errno): DomainException
     {
         $messages = [
             JSON_ERROR_DEPTH => 'Maximum stack depth exceeded',
@@ -541,7 +506,7 @@ class JWT
             JSON_ERROR_SYNTAX => 'Syntax error, malformed JSON',
             JSON_ERROR_UTF8 => 'Malformed UTF-8 characters' //PHP >= 5.3.3
         ];
-        throw new DomainException(
+        return new DomainException(
             isset($messages[$errno])
             ? $messages[$errno]
             : 'Unknown JSON error: ' . $errno

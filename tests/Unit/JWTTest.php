@@ -44,6 +44,212 @@ class JWTTest extends TestCase
         JWT::jsonDecode('this is not valid JSON string');
     }
 
+    public function testJsonDecodePreservesLegacyErrorsAndUnicode()
+    {
+        $this->assertJsonDecodeError('', 'Syntax error, malformed JSON');
+        $this->assertJsonDecodeError(
+            'this is not valid JSON string',
+            'Syntax error, malformed JSON'
+        );
+        $this->assertJsonDecodeError("\"\xB1\x31\"", 'Malformed UTF-8 characters');
+
+        $this->assertNull(JWT::jsonDecode('null'));
+        $decoded = JWT::jsonDecode('{"message":"\u4f60\u597d"}');
+        $this->assertSame('你好', $decoded->message);
+    }
+
+    public function testEmptyPayloadPreservesJsonSyntaxError()
+    {
+        $jwt = $this->encodeRawJwt(
+            '{"typ":"JWT","alg":"HS256"}',
+            '',
+            'unused-signing-key'
+        );
+
+        try {
+            JWT::decode($jwt, $this->hmacKey);
+            $this->fail('Expected a JSON syntax error');
+        } catch (DomainException $e) {
+            $this->assertSame('Syntax error, malformed JSON', $e->getMessage());
+        }
+    }
+
+    public function testHeadersArePublishedBeforeMalformedPayloadFails()
+    {
+        $headers = new stdClass();
+        $jwt = $this->encodeRawJwt(
+            '{"typ":"JWT","alg":"HS256"}',
+            '',
+            'unused-signing-key'
+        );
+
+        try {
+            JWT::decode($jwt, $this->hmacKey, $headers);
+            $this->fail('Expected a JSON syntax error');
+        } catch (DomainException $e) {
+            $this->assertSame('JWT', $headers->typ);
+            $this->assertSame('HS256', $headers->alg);
+        }
+    }
+
+    public function testUnicodePayloadIsPreserved()
+    {
+        $payload = [
+            'message' => '你好',
+            'emoji' => '😀',
+        ];
+
+        $encoded = JWT::encode($payload, $this->hmacKey->getKeyMaterial(), 'HS256');
+        $decoded = JWT::decode($encoded, $this->hmacKey);
+
+        $this->assertSame($payload['message'], $decoded->message);
+        $this->assertSame($payload['emoji'], $decoded->emoji);
+    }
+
+    public function testJsonErrorStateDoesNotLeakAcrossRetries()
+    {
+        try {
+            JWT::jsonEncode(['message' => pack('c', 128)]);
+            $this->fail('Expected a JSON encoding error');
+        } catch (DomainException $e) {
+            $this->assertSame('Malformed UTF-8 characters', $e->getMessage());
+        }
+
+        $this->assertSame(
+            '{"message":"ok"}',
+            JWT::jsonEncode(['message' => 'ok'])
+        );
+        $this->assertSame('ok', JWT::jsonDecode('{"message":"ok"}')->message);
+
+        $badJwt = $this->encodeRawJwt(
+            '{"typ":"JWT","alg":"HS256"}',
+            '',
+            'unused-signing-key'
+        );
+        try {
+            JWT::decode($badJwt, $this->hmacKey);
+            $this->fail('Expected a JSON syntax error');
+        } catch (DomainException $e) {
+            $this->assertSame('Syntax error, malformed JSON', $e->getMessage());
+        }
+
+        $goodJwt = JWT::encode(['message' => 'ok'], $this->hmacKey->getKeyMaterial(), 'HS256');
+        $this->assertSame('ok', JWT::decode($goodJwt, $this->hmacKey)->message);
+    }
+
+    public function testSignatureInvalidExceptionUsesLastDuplicateExp()
+    {
+        $jwt = $this->encodeRawJwt(
+            '{"typ":"JWT","alg":"HS256"}',
+            '{"sub":"duplicate-exp","exp":100,"exp":200}',
+            'wrong-signing-key'
+        );
+
+        try {
+            JWT::decode($jwt, $this->hmacKey);
+            $this->fail('Expected a signature error');
+        } catch (SignatureInvalidException $e) {
+            $this->assertInstanceOf(JWTExceptionWithPayloadInterface::class, $e);
+            $this->assertSame('duplicate-exp', $e->getPayload()->sub);
+            $this->assertSame(200, $e->getPayload()->exp);
+        }
+    }
+
+    public function testSignatureInvalidExceptionPayloadIsNotReusedAcrossDecodes()
+    {
+        $firstJwt = $this->encodeRawJwt(
+            '{"typ":"JWT","alg":"HS256"}',
+            '{"sub":"first-token","exp":100,"exp":200}',
+            'wrong-signing-key'
+        );
+        $secondJwt = $this->encodeRawJwt(
+            '{"typ":"JWT","alg":"HS256"}',
+            '{"sub":"second-token","exp":300,"exp":400}',
+            'wrong-signing-key'
+        );
+
+        try {
+            JWT::decode($firstJwt, $this->hmacKey);
+            $this->fail('Expected a signature error');
+        } catch (SignatureInvalidException $firstException) {
+            $firstPayload = $firstException->getPayload();
+        }
+
+        try {
+            JWT::decode($secondJwt, $this->hmacKey);
+            $this->fail('Expected a signature error');
+        } catch (SignatureInvalidException $secondException) {
+            $secondPayload = $secondException->getPayload();
+        }
+
+        $this->assertSame('first-token', $firstPayload->sub);
+        $this->assertSame(200, $firstPayload->exp);
+        $this->assertSame('second-token', $secondPayload->sub);
+        $this->assertSame(400, $secondPayload->exp);
+        $this->assertNotSame($firstPayload, $secondPayload);
+
+        $validJwt = $this->encodeRawJwt(
+            '{"typ":"JWT","alg":"HS256"}',
+            '{"sub":"first-valid-sub","sub":"last-valid-sub"}'
+        );
+        $this->assertSame('last-valid-sub', JWT::decode($validJwt, $this->hmacKey)->sub);
+        $this->assertSame('first-token', $firstPayload->sub);
+        $this->assertSame(200, $firstPayload->exp);
+    }
+
+    /**
+     * @runInSeparateProcess
+     */
+    public function testExpiredExceptionUsesLastDuplicateExp()
+    {
+        JWT::$timestamp = 300;
+        $jwt = $this->encodeRawJwt(
+            '{"typ":"JWT","alg":"HS256"}',
+            '{"sub":"expired-token","exp":100,"exp":200}'
+        );
+
+        try {
+            JWT::decode($jwt, $this->hmacKey);
+            $this->fail('Expected an expired token error');
+        } catch (ExpiredException $e) {
+            $this->assertSame('expired-token', $e->getPayload()->sub);
+            $this->assertSame(200, $e->getPayload()->exp);
+            $this->assertSame(300, $e->getTimestamp());
+        }
+    }
+
+    /**
+     * @runInSeparateProcess
+     */
+    public function testLeewayIsCapturedForTheParseTransaction()
+    {
+        JWT::$timestamp = 100;
+        JWT::$leeway = 10;
+        $jwt = $this->encodeRawJwt(
+            '{"typ":"JWT","alg":"HS256"}',
+            '{"sub":"leeway-token","exp":95}'
+        );
+
+        $decoded = JsonTransactionLeewayChangingJWT::decode($jwt, $this->hmacKey);
+
+        $this->assertSame('leeway-token', $decoded->sub);
+        $this->assertSame(0, JWT::$leeway);
+    }
+
+    public function testDuplicateKeysStayInTheirJsonDocument()
+    {
+        $jwt = $this->encodeRawJwt(
+            '{"typ":"JWT","kid":"first-kid","kid":"last-kid","alg":"HS256"}',
+            '{"sub":"first-sub","sub":"last-sub"}'
+        );
+        $headers = new stdClass();
+
+        $decoded = JWT::decode($jwt, $this->hmacKey, $headers);
+
+        $this->assertSame('last-sub', $decoded->sub);
+        $this->assertSame('last-kid', $headers->kid);
+    }
+
     public function testExpiredToken()
     {
         $this->expectException(ExpiredException::class);
@@ -891,8 +1097,42 @@ class JWTTest extends TestCase
         ];
     }
 
+    private function encodeRawJwt(string $headerJson, string $payloadJson, ?string $signingKey = null): string
+    {
+        $signingInput = JWT::urlsafeB64Encode($headerJson)
+            . '.' . JWT::urlsafeB64Encode($payloadJson);
+        $signature = \hash_hmac(
+            'sha256',
+            $signingInput,
+            $signingKey ?? $this->hmacKey->getKeyMaterial(),
+            true
+        );
+
+        return $signingInput . '.' . JWT::urlsafeB64Encode($signature);
+    }
+
+    private function assertJsonDecodeError(string $json, string $expectedMessage): void
+    {
+        try {
+            JWT::jsonDecode($json);
+            $this->fail('Expected a JSON decode error');
+        } catch (DomainException $e) {
+            $this->assertSame($expectedMessage, $e->getMessage());
+        }
+    }
+
     private function generateHmac256(): Key
     {
         return new Key(random_bytes(32), 'HS256');
+    }
+}
+
+class JsonTransactionLeewayChangingJWT extends JWT
+{
+    public static function urlsafeB64Decode(string $input): string
+    {
+        JWT::$leeway = 0;
+
+        return parent::urlsafeB64Decode($input);
     }
 }

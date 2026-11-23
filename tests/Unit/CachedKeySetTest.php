@@ -379,15 +379,6 @@ class CachedKeySetTest extends TestCase
             true // enable rate limiting
         );
 
-        // Set the rate limit cache to expire after 1 second
-        $cacheItem = $cachePool->getItem('jwksratelimitjwkshttpsjwk.uri');
-        $cacheItem->set([
-            'expiry' => new \DateTime('+1 second', new \DateTimeZone('UTC')),
-            'callsPerMinute' => 0,
-        ]);
-        $cacheItem->expiresAfter(1);
-        $cachePool->save($cacheItem);
-
         $invalidKid = 'invalidkey';
         for ($i = 0; $i < $shouldBeCalledTimes; $i++) {
             $this->assertFalse(isset($cachedKeySet[$invalidKid]));
@@ -398,12 +389,260 @@ class CachedKeySetTest extends TestCase
             $this->assertFalse(isset($cachedKeySet[$invalidKid]));
         }
 
-        sleep(1); // wait for cache to expire
+        // The rate-limit state lives in the same cache entry as the key set.
+        // Elapse the rate-limit window so requests are allowed again (a fresh
+        // window starts with a zeroed counter).
+        $expiryProperty = new \ReflectionProperty(CachedKeySet::class, 'rateLimitExpiry');
+        $expiryProperty->setAccessible(true);
+        $expiryProperty->setValue(
+            $cachedKeySet,
+            new \DateTime('-1 second', new \DateTimeZone('UTC'))
+        );
 
-        // These calls DO call HTTP because the cache has expired
+        // These calls DO call HTTP because the rate-limit window elapsed
         for ($i = 0; $i < $afterExpirationTimes; $i++) {
             $this->assertFalse(isset($cachedKeySet[$invalidKid]));
         }
+    }
+
+    public function testRateLimitAndKeySetShareOneCacheEntry()
+    {
+        $cachePool = $this->getTestMemoryCacheItemPool();
+
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $this->getMockHttpClient($this->testJwks1, 1),
+            $this->getMockHttpFactory(1),
+            $cachePool,
+            null,
+            true // enable rate limiting
+        );
+
+        // A successful refresh stores the key set and the rate-limit counters
+        // together in a single cache entry.
+        $this->assertTrue(isset($cachedKeySet['foo']));
+
+        $item = $cachePool->getItem($this->testJwksUriKey);
+        $this->assertTrue($item->isHit());
+        $data = $item->get();
+        $this->assertIsArray($data);
+        $this->assertArrayHasKey('keys', $data);
+        $this->assertArrayHasKey('rateLimit', $data);
+        $this->assertArrayHasKey('foo', $data['keys']);
+        $this->assertSame(1, $data['rateLimit']['callsPerMinute']);
+        $this->assertInstanceOf(\DateTimeInterface::class, $data['rateLimit']['expiry']);
+
+        // The legacy standalone rate-limit key must no longer be used.
+        $this->assertFalse($cachePool->hasItem('jwksratelimitjwkshttpsjwk.uri'));
+    }
+
+    public function testRateLimitRetriesDoNotMakeUnlimitedRequestsOnHttpError()
+    {
+        $response = $this->prophesize('Psr\Http\Message\ResponseInterface');
+        $response->getStatusCode()
+            ->shouldBeCalledTimes(10)
+            ->willReturn(429);
+        $response->getReasonPhrase()
+            ->willReturn('Too Many Requests');
+
+        $http = $this->prophesize(ClientInterface::class);
+        $http->sendRequest(Argument::any())
+            ->shouldBeCalledTimes(10)
+            ->willReturn($response->reveal());
+
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $http->reveal(),
+            $this->getMockHttpFactory(10),
+            $this->getTestMemoryCacheItemPool(),
+            null,
+            true // enable rate limiting
+        );
+
+        // Even with far more attempts than the limit, HTTP is called at most
+        // the configured number of times and no exception escapes.
+        for ($i = 0; $i < 25; $i++) {
+            $this->assertFalse(isset($cachedKeySet['missing']));
+        }
+    }
+
+    public function testRefreshFailureKeepsHealthyCachedKeys()
+    {
+        // First call succeeds and caches a healthy key set.
+        $successResponse = $this->prophesize('Psr\Http\Message\ResponseInterface');
+        $successResponse->getStatusCode()->willReturn(200);
+        $body = $this->prophesize('Psr\Http\Message\StreamInterface');
+        $body->__toString()->willReturn($this->testJwks1);
+        $successResponse->getBody()->willReturn($body->reveal());
+
+        // All subsequent refreshes are rate limited by the JWKS endpoint.
+        $errorResponse = $this->prophesize('Psr\Http\Message\ResponseInterface');
+        $errorResponse->getStatusCode()->willReturn(429);
+        $errorResponse->getReasonPhrase()->willReturn('Too Many Requests');
+
+        $http = $this->prophesize(ClientInterface::class);
+        $http->sendRequest(Argument::any())
+            ->willReturn($successResponse->reveal(), $errorResponse->reveal());
+
+        $cachePool = $this->getTestMemoryCacheItemPool();
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $http->reveal(),
+            $this->getMockHttpFactory(2),
+            $cachePool,
+            null,
+            true
+        );
+
+        // The healthy key is available from the initial fetch.
+        $this->assertTrue(isset($cachedKeySet['foo']));
+
+        // A rotated kid triggers a refresh, which fails with 429.
+        $this->assertFalse(isset($cachedKeySet['rotated']));
+
+        // The healthy cached key set is untouched: the old, still-valid key
+        // keeps resolving instead of the cache being cleared.
+        $this->assertTrue(isset($cachedKeySet['foo']));
+        $this->assertInstanceOf(Key::class, $cachedKeySet['foo']);
+
+        // A brand new instance reading the same cache entry still sees the
+        // healthy keys, proving the cache entry was not cleared on failure.
+        $newCachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $this->prophesize(ClientInterface::class)->reveal(),
+            $this->prophesize(RequestFactoryInterface::class)->reveal(),
+            $cachePool,
+            null,
+            true
+        );
+        $this->assertTrue(isset($newCachedKeySet['foo']));
+    }
+
+    public function testHttpErrorWithoutRateLimitStillThrows()
+    {
+        $response = $this->prophesize('Psr\Http\Message\ResponseInterface');
+        $response->getStatusCode()
+            ->shouldBeCalledOnce()
+            ->willReturn(429);
+        $response->getReasonPhrase()
+            ->shouldBeCalledOnce()
+            ->willReturn('Too Many Requests');
+
+        $http = $this->prophesize(ClientInterface::class);
+        $http->sendRequest(Argument::any())
+            ->shouldBeCalledOnce()
+            ->willReturn($response->reveal());
+
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $http->reveal(),
+            $this->getMockHttpFactory(1),
+            $this->getMockEmptyCache()
+        );
+
+        $this->expectException(\UnexpectedValueException::class);
+        $this->expectExceptionMessage('HTTP Error: 429 Too Many Requests');
+        $this->expectExceptionCode(429);
+
+        isset($cachedKeySet['foo']);
+    }
+
+    public function testConcurrentLookupsTriggerSingleHttpRequest()
+    {
+        // The HTTP mock fails the test if it is ever called: when a refresh is
+        // already in progress, concurrent lookups must short-circuit.
+        $http = $this->prophesize(ClientInterface::class);
+        $http->sendRequest(Argument::any())
+            ->shouldNotBeCalled();
+
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $http->reveal(),
+            $this->prophesize(RequestFactoryInterface::class)->reveal(),
+            $this->getTestMemoryCacheItemPool(),
+            null,
+            true
+        );
+
+        // Simulate an in-flight refresh (e.g. another concurrent decode).
+        $reflection = new \ReflectionProperty(CachedKeySet::class, 'refreshInProgress');
+        $reflection->setAccessible(true);
+        $reflection->setValue($cachedKeySet, true);
+
+        $this->assertFalse(isset($cachedKeySet['other']));
+    }
+
+    public function testRateLimitWindowRolloversAfterExpiry()
+    {
+        // All responses are valid; once the minute window elapses, calls must
+        // be allowed again instead of being rate limited forever.
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $this->getMockHttpClient($this->testJwks1, 11),
+            $this->getMockHttpFactory(11),
+            $this->getTestMemoryCacheItemPool(),
+            10,
+            true
+        );
+
+        $invalidKid = 'invalidkey';
+        for ($i = 0; $i < 10; $i++) {
+            $this->assertFalse(isset($cachedKeySet[$invalidKid]));
+        }
+        // The window is full: the next lookup does not call HTTP.
+        $this->assertFalse(isset($cachedKeySet[$invalidKid]));
+
+        // Force the current window into the past.
+        $expiryProperty = new \ReflectionProperty(CachedKeySet::class, 'rateLimitExpiry');
+        $expiryProperty->setAccessible(true);
+        $expiryProperty->setValue(
+            $cachedKeySet,
+            new \DateTime('-1 second', new \DateTimeZone('UTC'))
+        );
+
+        // A fresh window allows HTTP calls again.
+        $this->assertFalse(isset($cachedKeySet[$invalidKid]));
+    }
+
+    public function testFirstFetchHttpErrorRecoversAfterWindowRollover()
+    {
+        $errorResponse = $this->prophesize('Psr\Http\Message\ResponseInterface');
+        $errorResponse->getStatusCode()->willReturn(429);
+        $errorResponse->getReasonPhrase()->willReturn('Too Many Requests');
+
+        $successBody = $this->prophesize('Psr\Http\Message\StreamInterface');
+        $successBody->__toString()->willReturn($this->testJwks1);
+        $successResponse = $this->prophesize('Psr\Http\Message\ResponseInterface');
+        $successResponse->getStatusCode()->willReturn(200);
+        $successResponse->getBody()->willReturn($successBody->reveal());
+
+        $http = $this->prophesize(ClientInterface::class);
+        $http->sendRequest(Argument::any())
+            ->willReturn($errorResponse->reveal(), $successResponse->reveal());
+
+        $cachedKeySet = new CachedKeySet(
+            $this->testJwksUri,
+            $http->reveal(),
+            $this->getMockHttpFactory(2),
+            $this->getTestMemoryCacheItemPool(),
+            null,
+            true
+        );
+
+        // The very first fetch is rate limited: no keys, no exception.
+        $this->assertFalse(isset($cachedKeySet['foo']));
+
+        // Expire the window so the lookup is allowed to retry.
+        $expiryProperty = new \ReflectionProperty(CachedKeySet::class, 'rateLimitExpiry');
+        $expiryProperty->setAccessible(true);
+        $expiryProperty->setValue(
+            $cachedKeySet,
+            new \DateTime('-1 second', new \DateTimeZone('UTC'))
+        );
+
+        // The retry succeeds and the key resolves.
+        $this->assertTrue(isset($cachedKeySet['foo']));
+        $this->assertSame('foo', $cachedKeySet['foo']->getAlgorithm());
     }
 
     /**

@@ -346,7 +346,21 @@ This has the following advantages:
 
 1. The results are cached for performance.
 2. If an unrecognized key is requested, the cache is refreshed, to accomodate for key rotation.
-3. If rate limiting is enabled, the JWKS URI will not make more than 10 requests a second.
+3. If rate limiting is enabled, the JWKS URI will not make more than 10 requests a minute.
+
+The key set and the rate-limit counters share a single cache entry, so their
+lifecycles cannot drift apart. When rate limiting is enabled:
+
+- A failed refresh (for example an HTTP `429 Too Many Requests`) counts
+  against the limit but never clears the healthy cached key set; keys that are
+  still valid continue to verify tokens while a rotated key is unavailable.
+- After the limit is reached (or a refresh keeps failing), further lookups are
+  served from the cache instead of issuing additional HTTP requests, until the
+  rate-limit window elapses.
+- Concurrent lookups trigger at most one HTTP refresh at a time.
+
+When rate limiting is disabled, a non-`200` HTTP response is still surfaced as
+an `UnexpectedValueException`, as in previous versions.
 
 ```php
 use Firebase\JWT\CachedKeySet;
